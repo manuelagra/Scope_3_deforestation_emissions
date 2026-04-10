@@ -1,0 +1,484 @@
+# Chaco Scope-3 — Revised, Optimized Notebook (Execution-Ready) - Developer: Mario Barroso - The Nature Conservancy - Zero Conversion Commodities.
+
+This notebook implements the **conservative** specification agreed in the discussion:
+
+- `first_defor_year = 1985` for pixels already Non‑Natural in 1985 (legacy treated as *unknown* at baseline).
+- First conversion events are detected from **1986 onward**.
+- Primary **uncensored** reporting window for 1–20 years eligibility: **2006–2024**.
+- `first_defor_year` retains the **first** observed clearing even if a pixel later returns to Natural and is cleared again.
+- Optional sensitivity: `last_defor_year` workflow.
+
+The code is designed for **large rasters** and uses **block-wise processing** with `rasterio.windows`.
+
+
+# --- 0) Environment / Imports ---
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.warp import reproject
+from rasterio.windows import Window
+from rasterio.transform import array_bounds
+from tqdm.auto import tqdm
+
+print("OK: imports loaded")
+
+## 1) User configuration (paths & years)
+
+**Edit only this section** to run on your machine.
+
+
+# --- 1) Paths (EDIT ME) ---
+
+# Folder with annual Natural/Non-Natural rasters (MapBiomas Natural mask, binary)
+# Expected pattern: gcnat_mapbiomas-chaco-collection-50-{year}.tif
+NAT_DIR = Path(r"D:/Projetos/Chaco/gcnat")  # <-- EDIT
+
+# Folder with annual soy rasters
+# Expected pattern: soy_{year}.tif  (adapt below)
+SOY_DIR = Path(r"D:/Projetos/Chaco/soy")    # <-- EDIT
+
+# Biomass raster (baseline), used as master grid (recommended)
+BIOMASS_PATH = Path(r"D:/Projetos/Chaco/biomass/gc_biomass_1985R.tif")  # <-- EDIT
+
+# Age-to-emission fraction table (CSV)
+# Must include columns: 'idade' (int) and 'taxa' (float), where idade=1..20
+TAXA_CSV = Path(r"D:/Projetos/Chaco/taxa.csv")  # <-- EDIT
+
+# Output folder
+OUT_DIR = Path(r"D:/Projetos/Chaco/Scope3_out")  # <-- EDIT
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- Years ---
+Y0 = 1985
+NAT_YEARS = list(range(1985, 2024))  # 1985..2023 (edit if you have 2024)
+TARGET_YEARS = list(range(2005, 2025))  # 2005..2024
+
+# Uncensored window (guaranteed fully observed 1..20 ages)
+T_CLEAN_START = 2006
+
+print("OUT_DIR:", OUT_DIR)
+print("NAT_YEARS:", NAT_YEARS[0], "..", NAT_YEARS[-1])
+print("TARGET_YEARS:", TARGET_YEARS[0], "..", TARGET_YEARS[-1])
+
+## 2) Helper utilities
+- master-grid metadata (CRS/transform/shape/pixel area)
+- robust reproject to master (categorical / nearest)
+- block window iterator
+
+
+# --- 2) Helpers ---
+
+def get_master_profile(master_path: Path):
+    with rasterio.open(master_path) as ds:
+        profile = ds.profile.copy()
+        transform = ds.transform
+        crs = ds.crs
+        height, width = ds.height, ds.width
+
+        # Pixel area in hectares (best effort):
+        # For projected CRS in meters: pixel_area_m2 = |a * e| where transform = (a, b, c, d, e, f)
+        a = transform.a
+        e = transform.e
+        pixel_area_m2 = abs(a * e)
+        pixel_area_ha = pixel_area_m2 / 10000.0
+        return profile, (crs, transform, height, width, pixel_area_ha)
+
+def iter_block_windows(height, width, block_size=1024):
+    for row_off in range(0, height, block_size):
+        h = min(block_size, height - row_off)
+        for col_off in range(0, width, block_size):
+            w = min(block_size, width - col_off)
+            yield Window(col_off, row_off, w, h)
+
+def reproject_to_master(src_path: Path, master_meta, resampling=Resampling.nearest, src_nodata=None, dst_nodata=None):
+    """Reproject a full raster into master grid (in-memory array).
+    Use only for smaller rasters; for large rasters, prefer block-wise reproject.
+    """
+    crs_m, transform_m, height_m, width_m, _ = master_meta
+    dst = np.full((height_m, width_m), dst_nodata if dst_nodata is not None else 0, dtype=np.float32)
+
+    with rasterio.open(src_path) as src:
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=src_nodata if src_nodata is not None else src.nodata,
+            dst_transform=transform_m,
+            dst_crs=crs_m,
+            dst_nodata=dst_nodata,
+            resampling=resampling
+        )
+    return dst
+
+print("OK: helpers ready")
+
+## 3) Load emission fractions (`r(age)`)
+
+CSV requirement: columns `idade` and `taxa`, with idade integers 1..20.
+
+
+# --- 3) Load taxa table ---
+taxa_df = pd.read_csv(TAXA_CSV)
+taxa_df = taxa_df.rename(columns={c: c.strip().lower() for c in taxa_df.columns})
+if "idade" not in taxa_df.columns or "taxa" not in taxa_df.columns:
+    raise ValueError("TAXA_CSV must have columns: 'idade' and 'taxa'")
+
+taxa_df["idade"] = taxa_df["idade"].astype(int)
+taxa_df["taxa"] = taxa_df["taxa"].astype(float)
+
+# Build a lookup array up to 20 (index = age). age 0 -> 0.
+max_age = 20
+r = np.zeros(max_age + 1, dtype=np.float32)
+for _, row in taxa_df.iterrows():
+    a = int(row["idade"])
+    if 1 <= a <= max_age:
+        r[a] = float(row["taxa"])
+
+print("Loaded taxa for ages 1..20. Example:", r[1], r[20])
+
+## 4) Build `first_defor_year.tif` (block-wise)
+
+**Definition (conservative):**
+- If pixel is Non‑Natural already in 1985 → `first_defor_year = 1985`
+- Else: first year `y ≥ 1986` where it transitions Natural→Non‑Natural
+- If never converts through `Yₙ` → NoData
+
+We compute this **once**, aligned to the **master grid** (biomass).
+
+
+# --- 4) Build first_defor_year ---
+
+MASTER_PROFILE, MASTER_META = get_master_profile(BIOMASS_PATH)
+crs_m, transform_m, H, W, pixel_area_ha = MASTER_META
+
+FIRST_YEAR_PATH = OUT_DIR / "first_defor_year.tif"
+FIRST_YEAR_NODATA = 0  # 0 means 'never converted / unknown' (NoData)
+
+# Adapt this function if your Natural rasters have different naming
+def nat_path(year: int) -> Path:
+    return NAT_DIR / f"gcnat_mapbiomas-chaco-collection-50-{year}.tif"
+
+# Reading/reprojecting NAT to master grid per block
+def read_nat_block_to_master(year: int, win: Window, out_shape=None, out_dtype=np.uint8):
+    """Read a block from a NAT raster and reproject it into master-grid block.
+    We reproject *just the window bounds* by warping the full source but writing into the dst window area.
+    For simplicity & robustness, we do a full reproject into a temp array sized to dst window.
+    """
+    # Destination block array
+    dst_h = int(win.height)
+    dst_w = int(win.width)
+    dst = np.zeros((dst_h, dst_w), dtype=out_dtype)
+
+    # Compute destination bounds for this window
+    row0, col0 = int(win.row_off), int(win.col_off)
+    row1, col1 = row0 + dst_h, col0 + dst_w
+    # Bounds from transform
+    left, top = transform_m * (col0, row0)
+    right, bottom = transform_m * (col1, row1)
+    # Note: array_bounds expects (height,width,transform); here we already have bounds, keep as is.
+
+    with rasterio.open(nat_path(year)) as src:
+        # Create a transform for the destination window
+        dst_transform = rasterio.transform.from_bounds(left, bottom, right, top, dst_w, dst_h)
+
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=src.nodata,
+            dst_transform=dst_transform,
+            dst_crs=crs_m,
+            dst_nodata=0,
+            resampling=Resampling.nearest
+        )
+    return dst
+
+# Create output raster
+profile_out = MASTER_PROFILE.copy()
+profile_out.update(
+    dtype=rasterio.uint16,
+    count=1,
+    nodata=FIRST_YEAR_NODATA,
+    compress="deflate",
+    predictor=2,
+    tiled=True,
+    blockxsize=1024,
+    blockysize=1024
+)
+
+if FIRST_YEAR_PATH.exists():
+    print("NOTE: first_defor_year already exists:", FIRST_YEAR_PATH)
+else:
+    print("Building:", FIRST_YEAR_PATH)
+    with rasterio.open(FIRST_YEAR_PATH, "w", **profile_out) as dst:
+        # Initialize first_year = nodata (0)
+        for win in tqdm(list(iter_block_windows(H, W, 1024)), desc="Init first_year"):
+            block = np.full((int(win.height), int(win.width)), FIRST_YEAR_NODATA, dtype=np.uint16)
+            dst.write(block, 1, window=win)
+
+    # Pass 1: legacy mask from 1985 (Non‑Natural at baseline) => first_year=1985
+    with rasterio.open(FIRST_YEAR_PATH, "r+") as out_ds:
+        for win in tqdm(list(iter_block_windows(H, W, 1024)), desc="Legacy from 1985"):
+            nat85 = read_nat_block_to_master(1985, win).astype(np.uint8)
+            # nat85: 1=Natural, 0=Non‑Natural
+            legacy = (nat85 == 0)
+            block = out_ds.read(1, window=win).astype(np.uint16)
+            block[legacy] = 1985
+            out_ds.write(block, 1, window=win)
+
+    # Pass 2: scan years 1986..Yn, set first conversion year where currently nodata and transition occurs
+    with rasterio.open(FIRST_YEAR_PATH, "r+") as out_ds:
+        # Keep previous year's NAT for transition detection
+        for year in tqdm(NAT_YEARS[1:], desc="First conversion scan"):
+            if year < 1986:
+                continue
+            # iterate blocks
+            for win in iter_block_windows(H, W, 1024):
+                nat_prev = read_nat_block_to_master(year - 1, win).astype(np.uint8)
+                nat_cur  = read_nat_block_to_master(year, win).astype(np.uint8)
+                trans = (nat_prev == 1) & (nat_cur == 0)  # Natural -> Non-Natural
+
+                first_block = out_ds.read(1, window=win).astype(np.uint16)
+                unset = (first_block == FIRST_YEAR_NODATA)
+                first_block[unset & trans] = np.uint16(year)
+                out_ds.write(first_block, 1, window=win)
+
+    print("Done:", FIRST_YEAR_PATH)
+
+print("Pixel area (ha) from master grid:", pixel_area_ha)
+
+## 5) Annual emissions loop (2005–2024)
+
+For each year **T**, we:
+1. Read/reproject soy map to the master block
+2. Read biomass block (already in master grid)
+3. Read first_defor_year block
+4. Compute `age = max(0, T - first_defor_year)` for valid pixels
+5. Eligible: `soy==1` and `1<=age<=20`
+6. Emissions: `B * r(age) * pixel_area_ha`
+
+Outputs:
+- `emissions_annual.csv` (tons, areas)
+- optional: save annual rasters for QA (disabled by default)
+
+
+# --- 5) Annual emissions + frontier/legacy + age bins ---
+
+# Adapt this function to your soy naming
+def soy_path(year: int) -> Path:
+    return SOY_DIR / f"gc_soy_{year}.tif"  # <-- EDIT IF NEEDED
+
+def read_soy_block_to_master(year: int, win: Window, out_dtype=np.uint8):
+    dst_h = int(win.height); dst_w = int(win.width)
+    dst = np.zeros((dst_h, dst_w), dtype=out_dtype)
+
+    row0, col0 = int(win.row_off), int(win.col_off)
+    row1, col1 = row0 + dst_h, col0 + dst_w
+    left, top = transform_m * (col0, row0)
+    right, bottom = transform_m * (col1, row1)
+    dst_transform = rasterio.transform.from_bounds(left, bottom, right, top, dst_w, dst_h)
+
+    with rasterio.open(soy_path(year)) as src:
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=src.nodata,
+            dst_transform=dst_transform,
+            dst_crs=crs_m,
+            dst_nodata=0,
+            resampling=Resampling.nearest
+        )
+    return dst
+
+SAVE_QA_RASTERS = False  # set True to write per-year rasters (slow, big)
+qa_age_path = lambda y: OUT_DIR / f"age_soy_{y}.tif"
+qa_emis_path = lambda y: OUT_DIR / f"emission_{y}.tif"
+
+annual_rows = []
+
+with rasterio.open(BIOMASS_PATH) as bio_ds, rasterio.open(FIRST_YEAR_PATH) as fy_ds:
+    # Optionally create QA raster profiles
+    if SAVE_QA_RASTERS:
+        qa_profile = MASTER_PROFILE.copy()
+        qa_profile.update(dtype="float32", count=1, compress="deflate", predictor=2,
+                          tiled=True, blockxsize=1024, blockysize=1024, nodata=0)
+
+    for T in tqdm(TARGET_YEARS, desc="Years"):
+        emis_sum_t = 0.0
+
+        # Areas (ha)
+        soy_area_ha = 0.0
+        frontier_area_ha = 0.0
+        legacy_area_ha = 0.0
+
+        # Frontier bins (ha)
+        b1_5 = 0.0
+        b6_10 = 0.0
+        b11_15 = 0.0
+        b16_20 = 0.0
+
+        # Optional mean frontier age (pixel-weighted)
+        frontier_age_sum = 0.0
+        frontier_px_acc = 0
+
+        # Optional: open QA rasters
+        if SAVE_QA_RASTERS:
+            age_ds = rasterio.open(qa_age_path(T), "w", **{**qa_profile, "dtype":"uint8"})
+            ems_ds = rasterio.open(qa_emis_path(T), "w", **qa_profile)
+
+        for win in iter_block_windows(H, W, 1024):
+            biomass = bio_ds.read(1, window=win).astype(np.float32)
+            firsty  = fy_ds.read(1, window=win).astype(np.uint16)
+            soy     = read_soy_block_to_master(T, win).astype(np.uint8)
+
+            soy_m = (soy == 1)
+            valid_first = (firsty != FIRST_YEAR_NODATA)
+
+            # Total soy area
+            soy_px = int(soy_m.sum())
+            soy_area_ha += soy_px * pixel_area_ha
+
+            # Compute age (uint8) for valid pixels
+            age = np.zeros_like(firsty, dtype=np.uint8)
+            age_tmp = np.zeros_like(firsty, dtype=np.int32)
+            age_tmp[valid_first] = (T - firsty[valid_first]).astype(np.int32)
+            age_tmp = np.maximum(age_tmp, 0)
+            age_tmp = np.minimum(age_tmp, 255)
+            age[:] = age_tmp.astype(np.uint8)
+
+            # Conservative frontier/legacy split:
+            # - pre-1985 (legacy baseline) is firsty==1985, always LEGACY (even if age <=20 for early years)
+            pre85 = (firsty == 1985)
+            # Frontier: soy & 1..20 & NOT pre85
+            frontier = soy_m & (age >= 1) & (age <= 20) & valid_first & (~pre85)
+            # Legacy: soy & (pre85 OR age>20) ; also treat invalid_first as NOT eligible for either bucket
+            legacy = soy_m & valid_first & (pre85 | (age > 20))
+
+            # Areas
+            frontier_px = int(frontier.sum())
+            legacy_px   = int(legacy.sum())
+            frontier_area_ha += frontier_px * pixel_area_ha
+            legacy_area_ha   += legacy_px * pixel_area_ha
+
+            # Frontier bins
+            b1_5   += int((frontier & (age >= 1)  & (age <= 5)).sum())  * pixel_area_ha
+            b6_10  += int((frontier & (age >= 6)  & (age <= 10)).sum()) * pixel_area_ha
+            b11_15 += int((frontier & (age >= 11) & (age <= 15)).sum()) * pixel_area_ha
+            b16_20 += int((frontier & (age >= 16) & (age <= 20)).sum()) * pixel_area_ha
+
+            # Mean frontier age (pixel-weighted)
+            if frontier_px > 0:
+                frontier_age_sum += float(age[frontier].sum())
+                frontier_px_acc += frontier_px  # add to accumulator
+
+            # Emissions (tons): computed ONLY for frontier 1..20 (by spec)
+            rr = r[age]  # lookup 0..20
+            emis = np.where(frontier, biomass * rr * pixel_area_ha, 0.0).astype(np.float32)
+            emis_sum_t += float(emis.sum())
+
+            if SAVE_QA_RASTERS:
+                age_out = np.where(frontier, age, 0).astype(np.uint8)
+                age_ds.write(age_out, 1, window=win)
+                ems_ds.write(emis, 1, window=win)
+
+        if SAVE_QA_RASTERS:
+            age_ds.close()
+            ems_ds.close()
+
+        frontier_share = (frontier_area_ha / soy_area_ha) if soy_area_ha > 0 else np.nan
+        mean_frontier_age = (frontier_age_sum / frontier_px_acc) if frontier_px_acc > 0 else np.nan
+
+        annual_rows.append({
+            "year": T,
+            "emission_total_t": emis_sum_t,
+
+            "soy_area_total_ha": soy_area_ha,
+            "soy_area_frontier_ha": frontier_area_ha,
+            "soy_area_legacy_ha": legacy_area_ha,
+
+            "soy_area_1_5_ha": b1_5,
+            "soy_area_6_10_ha": b6_10,
+            "soy_area_11_15_ha": b11_15,
+            "soy_area_16_20_ha": b16_20,
+
+            "frontier_share": frontier_share,
+            "mean_frontier_age": mean_frontier_age,
+
+            "is_uncensored_window": (T >= T_CLEAN_START)
+        })
+
+annual_df = pd.DataFrame(annual_rows)
+annual_csv = OUT_DIR / "emissions_annual_frontier_legacy_bins.csv"
+annual_df.to_csv(annual_csv, index=False)
+
+annual_df.head(), annual_csv
+
+
+## 6) Quick checks / sanity
+
+These checks should hold:
+- eligible area ≤ soy area
+- emissions are zero when eligible area is zero
+- flag years < 2006 as potentially censored
+
+
+# --- 6) Sanity checks (frontier/legacy/bins) ---
+import pandas as pd
+
+csv_path = OUT_DIR / "emissions_annual_frontier_legacy_bins.csv"
+df = pd.read_csv(csv_path)
+
+# Basic constraints
+assert (df["soy_area_frontier_ha"] + df["soy_area_legacy_ha"] <= df["soy_area_total_ha"] + 1e-6).all(), "frontier+legacy exceeds total soy area"
+assert (df["soy_area_1_5_ha"] + df["soy_area_6_10_ha"] + df["soy_area_11_15_ha"] + df["soy_area_16_20_ha"] <= df["soy_area_frontier_ha"] + 1e-6).all(), "bins exceed frontier area"
+print("OK: area constraints pass")
+
+display(df.tail(10))
+print("CSV:", csv_path)
+
+
+# --- 7) Quick validation plots ---
+import matplotlib.pyplot as plt
+import pandas as pd
+
+df = pd.read_csv(OUT_DIR / "emissions_annual_frontier_legacy_bins.csv")
+years = df["year"].to_numpy()
+
+# 1) Stacked area: frontier vs legacy
+plt.figure()
+plt.stackplot(
+    years,
+    df["soy_area_frontier_ha"].to_numpy(),
+    df["soy_area_legacy_ha"].to_numpy(),
+    labels=["Frontier (1–20, excl. pre-1985)", "Legacy (>20 + pre-1985)"]
+)
+plt.xlabel("Year")
+plt.ylabel("Soy area (ha)")
+plt.title("Soy area: Frontier vs Legacy")
+plt.legend(loc="upper left")
+plt.tight_layout()
+plt.show()
+
+# 2) Frontier composition by age bins (stacked area)
+plt.figure()
+plt.stackplot(
+    years,
+    df["soy_area_1_5_ha"].to_numpy(),
+    df["soy_area_6_10_ha"].to_numpy(),
+    df["soy_area_11_15_ha"].to_numpy(),
+    df["soy_area_16_20_ha"].to_numpy(),
+    labels=["1–5", "6–10", "11–15", "16–20"]
+)
+plt.xlabel("Year")
+plt.ylabel("Frontier soy area (ha)")
+plt.title("Frontier composition by age bins")
+plt.legend(loc="upper left")
+plt.tight_layout()
+plt.show()
