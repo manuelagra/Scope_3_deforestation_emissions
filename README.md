@@ -1,9 +1,12 @@
 # Scope_3_deforestation_emissions
+
+
 Python script for the calculation of deforestation derived emissions of GHGs for the Gran Chaco
+
+
 Global deforestation remains a primary driver of the climate crisis, contributing approximately 8.1±2.5 GtCO2 e yr−1 in emissions and serving as a leading cause of catastrophic biodiversity loss. In this context, commodity production for international trade—specifically cattle and crop production— is responsible for an estimated 86% of global deforestation occurring between 2001 and 2022*. South America is a global deforestation hotspot where agricultural expansion is the dominant engine of land-use change. The region's most critical biomes have experienced staggering reductions in natural cover: the Amazonia has lost approximately 14% of its original forest, the Cerrado has seen a 27% reduction, and the Gran Chaco has lost around 20% of its natural vegetation*. These processes represent a massive transfer of carbon from stable terrestrial pools to the atmosphere.  
 
  
-
 Production-related impacts are classified as "Scope 3" emissions for food and agricultural companies, this means indirect emissions occurring in the value chain that frequently represent 80% to 90% of a company’s total carbon footprint*. While companies have historically focused on Scope 1 and 2 emissions, including land-use change (LUC) in corporate inventories is now a regulatory and scientific necessity under the GHG Protocol’s Land Sector and Removals Guidance (LSRG). This framework requires companies to provide site-specific evidence of direct land-use change (dLUC) to achieve completeness and transparency*. 
 
  
